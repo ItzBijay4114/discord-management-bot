@@ -11,8 +11,6 @@ from utils.storage import (
     update_task,
     get_task,
     list_tasks,
-    get_guild_tasks,
-    save_guild_tasks,
 )
 
 
@@ -120,11 +118,7 @@ class TaskMainView(discord.ui.View):
         self.cog = cog
         self.task_id = task_id
 
-    @discord.ui.button(label="Assign to Me", style=discord.ButtonStyle.primary, custom_id="task_assign_me")
-    async def assign_me(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.cog.handle_assign_me(interaction, self.task_id)
-
-    @discord.ui.button(label="Assign to Someone", style=discord.ButtonStyle.secondary, custom_id="task_assign_other")
+    @discord.ui.button(label="Assign to Developer", style=discord.ButtonStyle.primary, custom_id="task_assign_other")
     async def assign_other(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.cog.handle_assign_other(interaction, self.task_id)
 
@@ -133,20 +127,26 @@ class TaskMainView(discord.ui.View):
         await self.cog.handle_open_thread(interaction, self.task_id)
 
 
-class AssignOtherModal(discord.ui.Modal, title="Assign Task to Someone"):
-    user_id_input = discord.ui.TextInput(
-        label="User ID or mention",
-        placeholder="Paste user ID or mention the user in the channel.",
-        max_length=50
-    )
-
+class AssignUserSelect(discord.ui.UserSelect):
     def __init__(self, cog: "TasksCog", task_id: int):
-        super().__init__()
+        super().__init__(
+            placeholder="Select a developer to assign this task to...",
+            min_values=1,
+            max_values=1,
+            custom_id="task_assign_select"
+        )
         self.cog = cog
         self.task_id = task_id
 
-    async def on_submit(self, interaction: discord.Interaction):
-        await self.cog.handle_assign_other_submit(interaction, self.task_id, self.user_id_input.value)
+    async def callback(self, interaction: discord.Interaction):
+        selected_user = self.values[0]  # discord.Member
+        await self.cog.finish_assign_other(interaction, self.task_id, selected_user)
+
+
+class AssignUserView(discord.ui.View):
+    def __init__(self, cog: "TasksCog", task_id: int):
+        super().__init__(timeout=60)
+        self.add_item(AssignUserSelect(cog, task_id))
 
 
 class TaskThreadView(discord.ui.View):
@@ -219,8 +219,8 @@ class TasksCog(commands.Cog):
                 "Use the buttons below to create and manage tasks.\n\n"
                 "**Flow:**\n"
                 "1. Click **Create Task**\n"
-                "2. Assign the task and open its thread\n"
-                "3. Use the thread buttons to update status and submit work\n"
+                "2. A lead assigns the task to a developer\n"
+                "3. Use the task thread buttons to update status and submit work\n"
                 "4. When done, mark it completed (auto-logged & board updated)"
             ),
             color=discord.Color.blurple()
@@ -320,7 +320,6 @@ class TasksCog(commands.Cog):
         )
         msg = await interaction.channel.send(embed=embed)
 
-        # Save new board reference
         from utils.storage import update_server_config as _update
         _update(
             guild.id,
@@ -339,7 +338,6 @@ class TasksCog(commands.Cog):
     # ===== Logging & board helpers =====
 
     async def log_action(self, guild: discord.Guild, title: str, description: str):
-        from utils.storage import get_server_config
         cfg = get_server_config(guild.id)
         logs_id = cfg.get("logs_channel_id")
         if not logs_id:
@@ -357,9 +355,8 @@ class TasksCog(commands.Cog):
     async def update_task_board(self, guild: discord.Guild):
         """
         Updates the persistent task board message with current tasks.
-        Shows open & in-progress tasks; completed can be omitted or shown at bottom.
+        Shows open & in-progress tasks; completed are summarized.
         """
-        from utils.storage import get_server_config
         cfg = get_server_config(guild.id)
         board_channel_id = cfg.get("task_board_channel_id")
         board_message_id = cfg.get("task_board_message_id")
@@ -410,7 +407,6 @@ class TasksCog(commands.Cog):
             )
 
         if done_tasks:
-            # Show count, not details, to keep board clean
             done_ids = ", ".join(
                 f"#{t['id']}" for t in sorted(done_tasks, key=lambda x: x["id"])[:20]
             )
@@ -467,7 +463,6 @@ class TasksCog(commands.Cog):
             thread = guild.get_thread(thread_id)
 
         if not thread:
-            # create a new thread from original message
             try:
                 msg = await channel.fetch_message(task["message_id"])
             except discord.NotFound:
@@ -476,11 +471,10 @@ class TasksCog(commands.Cog):
 
             thread = await msg.create_thread(
                 name=f"Task #{task['id']} - {task['title'][:50]}",
-                auto_archive_duration=1440  # 24 hours
+                auto_archive_duration=1440
             )
             update_task(guild.id, task["id"], thread_id=thread.id)
 
-            # post initial controls
             await thread.send(
                 content=f"Thread for **Task #{task['id']}**.\n"
                         f"Use this thread to post updates, images, and final work.",
@@ -491,52 +485,38 @@ class TasksCog(commands.Cog):
 
     # ===== Button handlers =====
 
-    async def handle_assign_me(self, interaction: discord.Interaction, task_id: int):
+    async def handle_assign_other(self, interaction: discord.Interaction, task_id: int):
         guild = interaction.guild
         if not guild:
             return await interaction.response.send_message("Server only.", ephemeral=True)
+
+        # Only leads/managers can assign (here: manage_messages)
+        if not interaction.user.guild_permissions.manage_messages:
+            return await interaction.response.send_message(
+                "You don't have permission to assign tasks.",
+                ephemeral=True
+            )
+
         task = get_task(guild.id, task_id)
         if not task:
             return await interaction.response.send_message("Task not found.", ephemeral=True)
 
-        update_task(guild.id, task_id, assignee_id=interaction.user.id)
-        task = get_task(guild.id, task_id)
-        await self.refresh_task_message(guild, task)
-
-        await self.log_action(
-            guild,
-            f"Task #{task_id} assigned",
-            f"Assigned to {interaction.user.mention}"
+        view = AssignUserView(self, task_id)
+        await interaction.response.send_message(
+            "Select the developer to assign this task to:",
+            view=view,
+            ephemeral=True
         )
-        await interaction.response.send_message(f"Task #{task_id} assigned to you.", ephemeral=True)
 
-        await self.update_task_board(guild)
-
-    async def handle_assign_other(self, interaction: discord.Interaction, task_id: int):
-        modal = AssignOtherModal(self, task_id)
-        await interaction.response.send_modal(modal)
-
-    async def handle_assign_other_submit(self, interaction: discord.Interaction, task_id: int, user_str: str):
+    async def finish_assign_other(
+        self,
+        interaction: discord.Interaction,
+        task_id: int,
+        member: discord.Member
+    ):
         guild = interaction.guild
         if not guild:
             return await interaction.response.send_message("Server only.", ephemeral=True)
-
-        # Try to parse mention or ID
-        user_id = None
-        if user_str.startswith("<@") and user_str.endswith(">"):
-            # mention
-            user_str = user_str.strip("<@!>")
-        try:
-            user_id = int(user_str)
-        except ValueError:
-            pass
-
-        if not user_id:
-            return await interaction.response.send_message("Could not parse user ID.", ephemeral=True)
-
-        member = guild.get_member(user_id)
-        if not member:
-            return await interaction.response.send_message("User not found in this server.", ephemeral=True)
 
         task = get_task(guild.id, task_id)
         if not task:
@@ -545,12 +525,16 @@ class TasksCog(commands.Cog):
         update_task(guild.id, task_id, assignee_id=member.id)
         task = get_task(guild.id, task_id)
         await self.refresh_task_message(guild, task)
+
         await self.log_action(
             guild,
             f"Task #{task_id} assigned",
             f"Assigned to {member.mention} by {interaction.user.mention}"
         )
-        await interaction.response.send_message(f"Task #{task_id} assigned to {member.mention}.", ephemeral=True)
+        await interaction.response.edit_message(
+            content=f"Task #{task_id} assigned to {member.mention}.",
+            view=None
+        )
 
         await self.update_task_board(guild)
 
@@ -581,6 +565,14 @@ class TasksCog(commands.Cog):
         if not task:
             return await interaction.response.send_message("Task not found.", ephemeral=True)
 
+        assignee_id = task.get("assignee_id")
+        # Only assignee or managers can change status
+        if assignee_id and assignee_id != interaction.user.id and not interaction.user.guild_permissions.manage_messages:
+            return await interaction.response.send_message(
+                "Only the assigned developer or a manager can change the task status.",
+                ephemeral=True
+            )
+
         update_task(guild.id, task_id, status=new_status)
         task = get_task(guild.id, task_id)
         await self.refresh_task_message(guild, task)
@@ -598,7 +590,6 @@ class TasksCog(commands.Cog):
         await interaction.response.send_modal(modal)
 
     async def handle_submit_work_notes(self, interaction: discord.Interaction, task_id: int, notes: str):
-        # Notes will just be posted in the thread
         thread = interaction.channel
         if not isinstance(thread, discord.Thread):
             return await interaction.response.send_message(
@@ -627,9 +618,8 @@ class TasksCog(commands.Cog):
 
         assignee_id = task.get("assignee_id")
         if assignee_id and assignee_id != interaction.user.id and not interaction.user.guild_permissions.manage_messages:
-            # allow managers to override
             return await interaction.response.send_message(
-                "Only the assignee or a manager can mark this task as done.",
+                "Only the assigned developer or a manager can mark this task as done.",
                 ephemeral=True
             )
 
