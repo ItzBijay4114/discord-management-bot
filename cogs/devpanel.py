@@ -175,6 +175,4 @@ class DevPanelCog(commands.Cog):
 
 
 async def setup(bot: commands.Bot):
-    cog = DevPanelCog(bot)
-    bot.tree.add_command(cog.dev_group)
-    await bot.add_cog(cog)
+    await bot.add_cog(DevPanelCog(bot))
