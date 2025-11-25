@@ -113,6 +113,5 @@ class ConfigCog(commands.Cog):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 async def setup(bot: commands.Bot):
-    cog = ConfigCog(bot)
-    bot.tree.add_command(cog.config_group)
-    await bot.add_cog(cog)
+    # Just add the cog; the group is already defined as a class attribute
+    await bot.add_cog(ConfigCog(bot))
