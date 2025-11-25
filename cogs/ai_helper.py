@@ -10,7 +10,8 @@ from discord import app_commands
 from utils.storage import get_server_config
 
 GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
-GEMINI_MODEL = "gemini-1.5-flash"  # adjust as needed
+GEMINI_MODEL = "gemini-1.5-flash"  # valid model name for v1beta
+
 
 class AIHelperView(discord.ui.View):
     def __init__(self, cog: "AIHelperCog"):
@@ -111,7 +112,6 @@ class AIHelperCog(commands.Cog):
 
         await interaction.response.defer(thinking=True)
 
-        system_prompt = ""
         if mode == "brainstorm":
             system_prompt = (
                 "You are an AI assistant helping a Roblox game development team brainstorm ideas. "
@@ -120,9 +120,9 @@ class AIHelperCog(commands.Cog):
         elif mode == "breakdown":
             system_prompt = (
                 "You are an AI assistant helping a Roblox game developer break down complex tasks. "
-                "Return a list of clear, ordered steps, maybe with small notes or hints."
+                "Return a list of clear, ordered steps, with small notes or hints."
             )
-        else:  # general
+        else:
             system_prompt = (
                 "You are an AI assistant helping a Roblox game developer with scripting, design, and workflow. "
                 "Give concise but useful explanations with examples where necessary."
@@ -144,7 +144,7 @@ class AIHelperCog(commands.Cog):
                 "breakdown": "AI Task Breakdown",
                 "general": "AI Answer"
             }[mode],
-            description=response_text[:4000],  # Discord limit
+            description=response_text[:4000],
             color=discord.Color.purple()
         )
         embed.set_footer(text=f"Requested by {interaction.user}")
@@ -152,11 +152,7 @@ class AIHelperCog(commands.Cog):
         await interaction.followup.send(embed=embed)
 
     async def call_gemini_api(self, system_prompt: str, user_prompt: str) -> str:
-        """
-        Minimal example of calling Gemini via REST.
-        Adjust endpoint/model according to current Google AI API docs.
-        """
-        url = f"https://generativelanguage.googleapis.com/v1/models/{GEMINI_MODEL}:generateContent"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
         headers = {
             "Content-Type": "application/json",
             "x-goog-api-key": self.api_key
@@ -164,34 +160,31 @@ class AIHelperCog(commands.Cog):
         payload = {
             "contents": [
                 {
-                    "role": "system",
-                    "parts": [{"text": system_prompt}]
-                },
-                {
                     "role": "user",
-                    "parts": [{"text": user_prompt}]
+                    "parts": [
+                        {"text": system_prompt + "\n\nUser request:\n" + user_prompt}
+                    ]
                 }
             ]
         }
 
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload, headers=headers) as resp:
+                text = await resp.text()
                 if resp.status != 200:
-                    text = await resp.text()
                     raise RuntimeError(f"API error {resp.status}: {text}")
                 data = await resp.json()
 
-        # Parse the response; exact structure depends on API version
-        # For Gemini, typical structure:
-        # data["candidates"][0]["content"]["parts"][0]["text"]
         candidates = data.get("candidates", [])
         if not candidates:
             return "No response from AI."
-        content = candidates[0].get("content", {})
-        parts = content.get("parts", [])
+
+        parts = candidates[0].get("content", {}).get("parts", [])
         if not parts:
             return "No response from AI."
+
         return parts[0].get("text", "No text returned from AI.")
+
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(AIHelperCog(bot))
